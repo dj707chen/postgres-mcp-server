@@ -29,5 +29,7 @@ Read the following and follow @spec.md to understand what we want. All necessary
 - @https://raw.githubusercontent.com/porsager/postgres/refs/heads/master/README.md
 END
 
+# execute
+export DATABASE_URL=postgres://localhost/test
+npx @modelcontextprotocol/inspector bun run index.ts
 ```
-
