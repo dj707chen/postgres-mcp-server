@@ -33,3 +33,4 @@ END
 export DATABASE_URL=postgres://localhost/test
 npx @modelcontextprotocol/inspector bun run index.ts
 ```
+

@@ -1,152 +1,111 @@
+#!/usr/bin/env node
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
-  ListToolsRequestSchema,
   ListResourcesRequestSchema,
+  ListToolsRequestSchema,
   ReadResourceRequestSchema,
-  ListResourceTemplatesRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import postgres from "postgres";
 import { z } from "zod";
 
+// Environment configuration
 const DATABASE_URL = process.env.DATABASE_URL;
+const ALLOW_WRITE_OPS =
+  process.env.DANGEROUSLY_ALLOW_WRITE_OPS === "true" ||
+  process.env.DANGEROUSLY_ALLOW_WRITE_OPS === "1";
+
 if (!DATABASE_URL) {
-  console.error("DATABASE_URL environment variable is required");
+  console.error("Error: DATABASE_URL environment variable is required");
   process.exit(1);
 }
 
-const DANGEROUSLY_ALLOW_WRITE_OPS = 
-  process.env.DANGEROUSLY_ALLOW_WRITE_OPS === "true" || 
-  process.env.DANGEROUSLY_ALLOW_WRITE_OPS === "1";
-
-// Initialize postgres client
+// Create postgres connection
 const sql = postgres(DATABASE_URL);
 
-/**
- * Create an MCP server with capabilities for resources and tools.
- */
+// Zod schemas
+const QueryToolInputSchema = z.object({
+  query: z.string().describe("SQL query to execute"),
+});
+
+// Helper function to check if query is a write operation
+function isWriteOperation(query: string): boolean {
+  const writeKeywords = /^\s*(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE|REPLACE)\s/i;
+  return writeKeywords.test(query.trim());
+}
+
+// Helper function to get all tables in the database
+async function getTables(): Promise<string[]> {
+  const tables = await sql`
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+    AND table_type = 'BASE TABLE'
+    ORDER BY table_name
+  `;
+  return tables.map((row: any) => row.table_name);
+}
+
+// Create MCP server
 const server = new Server(
   {
     name: "postgres-mcp-server",
-    version: "0.1.0",
+    version: "1.0.0",
   },
   {
     capabilities: {
-      resources: {},
       tools: {},
+      resources: {},
     },
   }
 );
 
-/**
- * List available tables as resources.
- */
-server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  const tables = await sql`
-    SELECT table_name 
-    FROM information_schema.tables 
-    WHERE table_schema = 'public'
-  `;
-
-  return {
-    resources: tables.map((table) => ({
-      uri: `postgres://table/${table.table_name}`,
-      name: `Table: ${table.table_name}`,
-      description: `Schema and sample data from the ${table.table_name} table`,
-      mimeType: "application/json",
-    })),
-  };
-});
-
-/**
- * Read table schema and sample data.
- */
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  const url = new URL(request.params.uri);
-  if (url.protocol !== "postgres:") {
-    throw new Error(`Unsupported protocol: ${url.protocol}`);
-  }
-
-  const tableName = url.pathname.replace(/^\/table\//, "");
-  
-  // Get columns
-  const columns = await sql`
-    SELECT column_name, data_type, is_nullable
-    FROM information_schema.columns
-    WHERE table_name = ${tableName} AND table_schema = 'public'
-  `;
-
-  // Get sample data (first 10 rows)
-  const sampleData = await sql`SELECT * FROM ${sql(tableName)} LIMIT 10`;
-
-  return {
-    contents: [
-      {
-        uri: request.params.uri,
-        mimeType: "application/json",
-        text: JSON.stringify({
-          schema: columns,
-          sample: sampleData
-        }, null, 2),
-      },
-    ],
-  };
-});
-
-/**
- * List available tools.
- */
+// List available tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
         name: "query",
-        description: "Execute a PostgreSQL query. By default, only SELECT queries are allowed unless write ops are enabled.",
+        description: ALLOW_WRITE_OPS
+          ? "Execute a SQL query (read or write operations allowed)"
+          : "Execute a read-only SQL query (SELECT statements only)",
         inputSchema: {
           type: "object",
           properties: {
-            sql: {
+            query: {
               type: "string",
-              description: "The SQL query to execute",
+              description: "SQL query to execute",
             },
           },
-          required: ["sql"],
+          required: ["query"],
         },
       },
     ],
   };
 });
 
-/**
- * Handle tool calls.
- */
+// Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (request.params.name === "query") {
-    const { sql: queryText } = z.object({
-      sql: z.string()
-    }).parse(request.params.arguments);
+    const input = QueryToolInputSchema.parse(request.params.arguments);
+    const query = input.query;
 
-    // Simple check for write operations if not allowed
-    if (!DANGEROUSLY_ALLOW_WRITE_OPS) {
-      const isReadonly = queryText.trim().toLowerCase().startsWith("select") || 
-                        queryText.trim().toLowerCase().startsWith("with");
-      
-      if (!isReadonly) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error: Only SELECT queries are allowed. Set DANGEROUSLY_ALLOW_WRITE_OPS=true to enable write operations.",
-            },
-          ],
-          isError: true,
-        };
-      }
+    // Check if write operation is allowed
+    if (isWriteOperation(query) && !ALLOW_WRITE_OPS) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: Write operations are not allowed. Set DANGEROUSLY_ALLOW_WRITE_OPS=true to enable write operations.",
+          },
+        ],
+      };
     }
 
     try {
-      const result = await sql.unsafe(queryText);
+      const result = await sql.unsafe(query);
       return {
         content: [
           {
@@ -160,27 +119,77 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: `Query error: ${error.message}`,
+            text: `Error executing query: ${error.message}`,
           },
         ],
-        isError: true,
       };
     }
   }
 
-  throw new Error(`Tool not found: ${request.params.name}`);
+  throw new Error(`Unknown tool: ${request.params.name}`);
 });
 
-/**
- * Start the server using stdio transport.
- */
+// List available resources (tables)
+server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  try {
+    const tables = await getTables();
+    return {
+      resources: tables.map((table) => ({
+        uri: `table:///${table}`,
+        name: table,
+        description: `PostgreSQL table: ${table}`,
+        mimeType: "application/json",
+      })),
+    };
+  } catch (error: any) {
+    console.error("Error listing tables:", error);
+    return { resources: [] };
+  }
+});
+
+// Read resource (table data)
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  const uri = request.params.uri;
+  const match = uri.match(/^table:\/\/\/(.+)$/);
+
+  if (!match) {
+    throw new Error(`Invalid resource URI: ${uri}`);
+  }
+
+  const tableName = match[1];
+
+  try {
+    // Validate table exists
+    const tables = await getTables();
+    if (!tables.includes(tableName)) {
+      throw new Error(`Table not found: ${tableName}`);
+    }
+
+    // Get table data (limit to 100 rows for safety)
+    const rows = await sql`SELECT * FROM ${sql(tableName)} LIMIT 100`;
+
+    return {
+      contents: [
+        {
+          uri,
+          mimeType: "application/json",
+          text: JSON.stringify(rows, null, 2),
+        },
+      ],
+    };
+  } catch (error: any) {
+    throw new Error(`Error reading table ${tableName}: ${error.message}`);
+  }
+});
+
+// Start server
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Postgres MCP server running on stdio");
+  console.error(`PostgreSQL MCP Server running (Write operations: ${ALLOW_WRITE_OPS ? "ENABLED" : "DISABLED"})`);
 }
 
 main().catch((error) => {
-  console.error("Server error:", error);
+  console.error("Fatal error:", error);
   process.exit(1);
 });
