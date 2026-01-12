@@ -1,0 +1,3 @@
+Read the following and follow @spec.md to understand what we want. All necessary dependencies are installed
+- @https://raw.githubusercontent.com/modelcontextprotocol/typescript-sdk/refs/heads/main/README.md
+- @https://raw.githubusercontent.com/porsager/postgres/refs/heads/master/README.md
